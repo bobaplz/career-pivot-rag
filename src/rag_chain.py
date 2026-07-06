@@ -14,12 +14,39 @@ from src import config
 
 load_dotenv()
 
+# Sentinel the grounded prompt emits when the corpus can't answer —
+# detected in code to trigger the general-knowledge fallback.
+NOT_IN_CONTEXT = "NOT_IN_CONTEXT"
+
+TRANSLATION_PROMPT = ChatPromptTemplate.from_template(
+    """Rewrite the question in English so it can be used to search an English-language knowledge base.
+If the question is already in English, return it unchanged.
+Return only the rewritten question, nothing else.
+
+Question: {question}"""
+)
+
+FALLBACK_PROMPT = ChatPromptTemplate.from_template(
+    """You are a helpful assistant for analysts transitioning into data science.
+The question is outside the knowledge base, so answer from your own general knowledge.
+Be accurate. If you are not confident about a fact (e.g. future events, obscure
+details, anything you might be misremembering), say you don't know — do not guess.
+Answer in the same language the question is written in.
+
+Question: {question}
+
+Answer:"""
+)
+
 PROMPT = ChatPromptTemplate.from_template(
     """You are a helpful assistant for analysts transitioning into data science.
-Answer the question using ONLY the context below.
-If the context doesn't contain the answer, say you don't know — do not guess.
-Each context chunk begins with a bracketed label like [filename.md § Section Title].
-Cite the source of each claim inline by copying that exact label.
+Answer in the same language the question is written in.
+Ground your answer in the context below — it comes from the user's hand-written study notes.
+Where the context is silent on a relevant detail, you may carefully supplement with
+general knowledge, but never contradict the context.
+Do not mention the notes, the context, or file names in your answer — sources are
+shown separately in the UI.
+If the context is entirely irrelevant to the question, reply with exactly NOT_IN_CONTEXT and nothing else.
 
 Context:
 {context}
@@ -30,12 +57,18 @@ Answer:"""
 )
 
 
-def format_chunk(doc):
-    """Render one retrieved chunk with its citation metadata."""
-    source = doc.metadata.get("source", "unknown")
-    # Deepest header available = most specific section label
-    section = doc.metadata.get("h3") or doc.metadata.get("h2") or doc.metadata.get("h1") or ""
-    return f"[{source} § {section}]\n{doc.page_content}"
+def source_labels(docs):
+    """Deduplicated '[file § section]' labels for the UI, from chunk metadata."""
+    labels, seen = [], set()
+    for doc in docs:
+        source = doc.metadata.get("source", "unknown").removesuffix(".md")
+        # Deepest header available = most specific section label
+        section = doc.metadata.get("h3") or doc.metadata.get("h2") or doc.metadata.get("h1") or ""
+        label = f"{source} § {section}" if section else source
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return labels
 
 
 def build_chain():
@@ -45,14 +78,47 @@ def build_chain():
         embedding_function=embeddings,
         persist_directory=config.CHROMA_PERSIST_DIR,
     )
-    retriever = vector_store.as_retriever(search_kwargs={"k": config.TOP_K})
     llm = ChatOpenAI(model=config.LLM_MODEL, temperature=0)
+    translator = TRANSLATION_PROMPT | llm | StrOutputParser()
 
-    def answer(question: str) -> str:
-        docs = retriever.invoke(question)
-        context = "\n\n---\n\n".join(format_chunk(d) for d in docs)
+    def answer(question: str, category: str | None = None) -> dict:
+        """Returns {"answer": str, "sources": [str, ...]}."""
+        # Corpus is English: non-English questions retrieve poorly against it
+        # (observed with Korean), so translate the query before embedding.
+        # ASCII fast path keeps English questions at zero extra latency/cost.
+        search_query = question
+        if not question.isascii():
+            search_query = translator.invoke({"question": question}).strip()
+
+        # Category picker: restrict retrieval to one note file
+        search_filter = None
+        if category in config.CATEGORIES:
+            search_filter = {"source": config.CATEGORIES[category]}
+
+        docs = vector_store.similarity_search(
+            search_query, k=config.TOP_K, filter=search_filter
+        )
+        context = "\n\n---\n\n".join(d.page_content for d in docs)
         chain = PROMPT | llm | StrOutputParser()
-        return chain.invoke({"context": context, "question": question})
+        result = chain.invoke({"context": context, "question": question})
+
+        if NOT_IN_CONTEXT in result:
+            if not config.GENERAL_KNOWLEDGE_FALLBACK:
+                return {
+                    "answer": "I don't know — this isn't covered by the knowledge base.",
+                    "sources": [],
+                }
+            fallback = FALLBACK_PROMPT | llm | StrOutputParser()
+            general = fallback.invoke({"question": question})
+            return {
+                "answer": (
+                    "*💡 Not in my notes — answering from general knowledge:*\n\n"
+                    + general
+                ),
+                "sources": [],
+            }
+
+        return {"answer": result, "sources": source_labels(docs)}
 
     return answer
 
@@ -60,4 +126,9 @@ def build_chain():
 if __name__ == "__main__":
     question = " ".join(sys.argv[1:]) or "Why does NOT IN return no rows when the subquery has NULLs?"
     answer = build_chain()
-    print(answer(question))
+    result = answer(question)
+    print(result["answer"])
+    if result["sources"]:
+        print("\n--- Sources ---")
+        for label in result["sources"]:
+            print(f"  {label}")
